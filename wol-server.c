@@ -10,8 +10,10 @@
 #include <net/if.h>
 #include <netinet/udp.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <semaphore.h>
-#include <pthread.h>
 #include <time.h>
 
 #define BUFFER_SIZE 4096
@@ -74,7 +76,8 @@ typedef struct {
     int valid;
 } SessionKey;
 
-SessionKey session = {{0}, {0}, 0};
+static SessionKey *session = NULL;  // 指向共享内存
+static sem_t *session_sem = NULL;  // 用于保护 session 的信号量
 sem_t client_sem;
 
 // 发送 WOL 魔术包
@@ -250,19 +253,21 @@ void handle_request(int client_fd) {
 
         // 如果设置了密码种子，生成新的会话密钥
         if (config.password_seed[0] != '\0') {
-            generate_random_string(session.random_str, 8);
+            sem_wait(session_sem);
+            generate_random_string(session->random_str, 8);
             char crc_input[128];
-            snprintf(crc_input, sizeof(crc_input), "%s%s", session.random_str, config.password_seed);
+            snprintf(crc_input, sizeof(crc_input), "%s%s", session->random_str, config.password_seed);
             char crc_output[9];
             crc32_hex(crc_input, crc_output);
-            strncpy(session.access_code, crc_output, 8);
-            session.access_code[8] = '\0';
-            session.valid = 1;
+            strncpy(session->access_code, crc_output, 8);
+            session->access_code[8] = '\0';
+            session->valid = 1;
+            sem_post(session_sem);
 
             resp_len = snprintf(response, sizeof(response),
                 "Wake-on-LAN Tool Usage\n\n"
                 "Random Token: %s\n"
-                "Access Code: 8 Byte code, please calculate it\n"
+                "Access Code: crc32(Token+signature)\n"
                 "(Use this code once, then it expires)\n\n"
                 "=== Wake-on-LAN ===\n"
                 "  curl -X POST \"http://localhost:8080/wake?mac=AA:BB:CC:DD:EE:FF&code=XXXXXXXX\"\n"
@@ -270,7 +275,7 @@ void handle_request(int client_fd) {
                 "=== Shutdown Broadcast ===\n"
                 "  curl -X POST \"http://localhost:8080/sleep?code=XXXXXXXX\"\n"
                 "  curl -X POST \"http://localhost:8080/sleep?ip=192.168.1.255&code=XXXXXXXX\"\n",
-                session.random_str);
+                session->random_str);
         } else {
             resp_len = snprintf(response, sizeof(response),
                 "Wake-on-LAN Tool Usage\n\n"
@@ -306,17 +311,21 @@ void handle_request(int client_fd) {
 
         // 验证访问码
         if (config.password_seed[0] != '\0') {
-            if (!session.valid) {
+            sem_wait(session_sem);
+            if (!session->valid) {
+                sem_post(session_sem);
                 send_response(client_fd, 401, "Unauthorized",
                              "text/plain", "Please visit / to get a new access code", 0);
                 return;
             }
-            if (strcmp(code, session.access_code) != 0) {
+            if (strcmp(code, session->access_code) != 0) {
+                sem_post(session_sem);
                 send_response(client_fd, 401, "Unauthorized",
                              "text/plain", "Invalid access code", 0);
                 return;
             }
-            session.valid = 0;  // 使密钥失效
+            session->valid = 0;  // 使密钥失效
+            sem_post(session_sem);
         }
 
         if (mac[0] == '\0') {
@@ -379,17 +388,21 @@ void handle_request(int client_fd) {
 
         // 验证访问码
         if (config.password_seed[0] != '\0') {
-            if (!session.valid) {
+            sem_wait(session_sem);
+            if (!session->valid) {
+                sem_post(session_sem);
                 send_response(client_fd, 401, "Unauthorized",
                              "text/plain", "Please visit / to get a new access code", 0);
                 return;
             }
-            if (strcmp(code, session.access_code) != 0) {
+            if (strcmp(code, session->access_code) != 0) {
+                sem_post(session_sem);
                 send_response(client_fd, 401, "Unauthorized",
                              "text/plain", "Invalid access code", 0);
                 return;
             }
-            session.valid = 0;  // 使密钥失效
+            session->valid = 0;  // 使密钥失效
+            sem_post(session_sem);
         }
 
         char response[256] = {0};
@@ -417,8 +430,24 @@ void start_server() {
     int opt = 1;
     int addrlen = sizeof(address);
 
-    // 初始化信号量
-    sem_init(&client_sem, 0, MAX_CLIENTS);
+    // 创建匿名共享内存用于 session
+    session = mmap(NULL, sizeof(SessionKey), PROT_READ | PROT_WRITE,MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (session == MAP_FAILED) {
+        perror("创建共享内存失败");
+        exit(EXIT_FAILURE);
+    }
+    session->valid = 0;
+
+    // 创建用于保护 session 的信号量 (跨进程共享)
+    session_sem = mmap(NULL, sizeof(sem_t), PROT_READ | PROT_WRITE,MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (session_sem == MAP_FAILED) {
+        perror("创建信号量共享内存失败");
+        exit(EXIT_FAILURE);
+    }
+    sem_init(session_sem, 1, 1);  // 第二个参数 1 表示进程间共享
+
+    // 初始化连接限制信号量
+    sem_init(&client_sem, 1, MAX_CLIENTS);
 
     // 创建 socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
